@@ -60,6 +60,7 @@ from bot.messages import (
     MSG_EVENT_TIME_NOT_SET,
     MSG_INVALID_DATE,
     MSG_INVALID_TIME,
+    MSG_NEXT_EVENT,
     format_days_until,
     random_no_events,
 )
@@ -301,6 +302,26 @@ async def process_confirm_cancel(callback: CallbackQuery, state: FSMContext) -> 
 _NEARBY_MARKER_THRESHOLD_DAYS = 14
 
 
+def _event_date(event) -> date:
+    """Парсит event_date из БД ('ГГГГ-ММ-ДД') в объект date."""
+    return datetime.strptime(event["event_date"], _DB_DATE_FORMAT).date()
+
+
+def _format_event_title_line(event, event_date: date) -> str:
+    """
+    Строит строку "дата (+ время, если указано) — название" — общий
+    формат одной записи, который используют и /all_events, и /next_event.
+    event_date передаётся отдельным параметром, чтобы не парсить дату
+    из строки повторно там, где она уже понадобилась вызывающему коду
+    (например, для расчёта "через сколько дней").
+    """
+    line = event_date.strftime(_USER_DATE_FORMAT)
+    if event["start_time"]:
+        line += f" {event['start_time']}"
+    line += f" — {event['title']}"
+    return line
+
+
 def _format_events_list(events: list) -> str:
     """
     Собирает текст списка событий для {events_list} в MSG_ALL_EVENTS.
@@ -320,11 +341,8 @@ def _format_events_list(events: list) -> str:
     today = date.today()
     entries = []
     for index, event in enumerate(events):
-        event_date = datetime.strptime(event["event_date"], _DB_DATE_FORMAT).date()
-        line = event_date.strftime(_USER_DATE_FORMAT)
-        if event["start_time"]:
-            line += f" {event['start_time']}"
-        line += f" — {event['title']}"
+        event_date = _event_date(event)
+        line = _format_event_title_line(event, event_date)
 
         if index == 0:
             days_until = (event_date - today).days
@@ -355,3 +373,35 @@ async def cmd_all_events(message: Message) -> None:
         return
 
     await message.answer(MSG_ALL_EVENTS.format(events_list=_format_events_list(events)))
+
+
+@router.message(Command("next_event"))
+async def cmd_next_event(message: Message) -> None:
+    """
+    /next_event — раздел 3.4 брифа. Чистое чтение: показывает только
+    самое ближайшее предстоящее событие чата (get_upcoming_events уже
+    возвращает события отсортированными от ближайшего к дальнему —
+    достаточно взять первую строку).
+
+    Важный нюанс из брифа: событие сегодняшнего дня остаётся "ближайшим"
+    весь день, даже если время его начала уже прошло — get_upcoming_events
+    фильтрует по дате (event_date >= сегодня), а не по времени.
+    """
+    events = get_upcoming_events(message.chat.id)
+
+    if not events:
+        await message.answer(random_no_events())
+        return
+
+    event = events[0]
+    event_date = _event_date(event)
+
+    body = _format_event_title_line(event, event_date)
+    if event["description"]:
+        body += f"\n{event['description']}"
+    # В отличие от /all_events, где пометка "через N" появляется только
+    # у событий ближе чем через 2 недели, здесь "через сколько дней"
+    # показывается всегда — это весь смысл команды (раздел 3.4 брифа).
+    body += f"\n{format_days_until((event_date - date.today()).days)}"
+
+    await message.answer(MSG_NEXT_EVENT.format(body=body))
