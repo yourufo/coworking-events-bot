@@ -282,3 +282,79 @@ def get_upcoming_events(chat_id: int) -> list[sqlite3.Row]:
         return cursor.fetchall()
     finally:
         conn.close()
+
+
+def get_past_events(chat_id: int) -> list[sqlite3.Row]:
+    """
+    Возвращает ПРОШЕДШИЕ события чата (event_date < сегодня), от самого
+    недавнего к самому старому — зеркально get_upcoming_events, только
+    в другую сторону по времени и с обратной сортировкой: самое вероятно
+    нужное (недавно прошедшее) оказывается сверху списка.
+
+    Используется в /delete_event (раздел 3.3 брифа) как один из двух
+    списков на выбор — вместе с get_upcoming_events. Единый список из
+    ВСЕХ событий чата (без разделения на прошедшие/предстоящие) быстро
+    становится нечитаемой портянкой, особенно в чате, который живёт
+    больше года; тот же паттерн пригодится и в будущем /edit_event.
+    """
+    conn = get_connection()
+    try:
+        today_iso = date.today().isoformat()
+        cursor = conn.execute(
+            """
+            SELECT id, title, event_date, start_time, description
+            FROM events
+            WHERE chat_id = ? AND event_date < ?
+            ORDER BY event_date DESC, start_time DESC
+            """,
+            (chat_id, today_iso),
+        )
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def get_event_by_id(chat_id: int, event_id: int) -> sqlite3.Row | None:
+    """
+    Возвращает одно событие по id — с обязательной проверкой, что оно
+    принадлежит именно этому чату (chat_id в условии WHERE, не только id).
+
+    Зачем это, если id и так уникален на всю БД: id события летает в
+    callback_data инлайн-кнопок между шагами диалога /delete_event. Без
+    проверки chat_id пользователь одного чата, теоретически подставив
+    чужой id (или просто "угадав" маленькое число), мог бы посмотреть
+    или удалить событие из другого чата, где бот тоже работает.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            SELECT id, title, event_date, start_time, description
+            FROM events
+            WHERE id = ? AND chat_id = ?
+            """,
+            (event_id, chat_id),
+        )
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def delete_event(chat_id: int, event_id: int) -> bool:
+    """
+    Удаляет событие по id (с той же проверкой chat_id, что и в
+    get_event_by_id — по той же причине). Возвращает True, если строка
+    была реально удалена, и False — если события с таким id в этом чате
+    уже не было (например, кто-то успел удалить его раньше, пока экран
+    подтверждения ещё висел в чате открытым).
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM events WHERE id = ? AND chat_id = ?",
+            (event_id, chat_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
