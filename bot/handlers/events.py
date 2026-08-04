@@ -1,5 +1,6 @@
 """
-Обработчики команд про события. Пока только `/add_event` (раздел 3.1 брифа).
+Обработчики команд про события: /add_event, /all_events, /next_event,
+/delete_event, /edit_event (разделы 3.1–3.5 брифа).
 
 Как устроен пошаговый диалог (FSM — "конечный автомат")
 ---------------------------------------------------------
@@ -50,6 +51,7 @@ from bot.database import (
     get_past_events,
     get_upcoming_events,
     insert_event,
+    update_event,
     upsert_chat,
     upsert_user,
 )
@@ -57,6 +59,12 @@ from bot.messages import (
     MSG_ALL_EVENTS,
     MSG_ASK_DELETE_EVENT_CHOICE,
     MSG_ASK_DELETE_EVENT_SCOPE,
+    MSG_ASK_EDIT_DATE,
+    MSG_ASK_EDIT_DESCRIPTION,
+    MSG_ASK_EDIT_EVENT_CHOICE,
+    MSG_ASK_EDIT_EVENT_SCOPE,
+    MSG_ASK_EDIT_TIME,
+    MSG_ASK_EDIT_TITLE,
     MSG_ASK_EVENT_DATE,
     MSG_ASK_EVENT_DESCRIPTION,
     MSG_ASK_EVENT_DESCRIPTION_CHOICE,
@@ -65,11 +73,18 @@ from bot.messages import (
     MSG_ASK_EVENT_TITLE,
     MSG_CANCELLED,
     MSG_DELETE_EVENT_CONFIRM,
+    MSG_EDIT_ENTER_DATE,
+    MSG_EDIT_ENTER_DESCRIPTION,
+    MSG_EDIT_ENTER_TIME,
+    MSG_EDIT_ENTER_TITLE,
+    MSG_EDIT_NOTHING_CHANGED,
     MSG_EVENT_ADDED,
     MSG_EVENT_ALREADY_GONE,
     MSG_EVENT_DESCRIPTION_NOT_SET,
+    MSG_EVENT_EDIT_CONFIRM,
     MSG_EVENT_SAVED,
     MSG_EVENT_TIME_NOT_SET,
+    MSG_EVENT_UPDATED,
     MSG_INVALID_DATE,
     MSG_INVALID_TIME,
     MSG_NEXT_EVENT,
@@ -93,6 +108,30 @@ class AddEventStates(StatesGroup):
     # Описание — тот же паттерн, что и время выше: кнопки выбора, и только
     # при "Добавить описание" — ждём текст.
     waiting_description_choice = State()
+    waiting_description_text = State()
+    confirm = State()
+
+
+class EditEventStates(StatesGroup):
+    """
+    Состояния диалога /edit_event (раздел 3.2 брифа). В отличие от
+    AddEventStates, каждое поле проходит через пару "спросить да/нет,
+    надо ли менять" (asking_*) → при "да" отдельное состояние ждёт новый
+    текст (waiting_*_text) → в любом случае (да с текстом или сразу нет)
+    переходим к вопросу про следующее поле. Список кнопками и выбор
+    конкретного события (до этого класса состояний) идут БЕЗ FSM — это
+    чистая навигация по кнопкам, id события едет в callback_data (тот же
+    подход, что и в /delete_event) — состояние нужно только с момента,
+    когда начинаются да/нет-вопросы с возможным текстовым вводом.
+    """
+
+    asking_title = State()
+    waiting_title_text = State()
+    asking_date = State()
+    waiting_date_text = State()
+    asking_time = State()
+    waiting_time_text = State()
+    asking_description = State()
     waiting_description_text = State()
     confirm = State()
 
@@ -131,6 +170,38 @@ _DESCRIPTION_CHOICE_KEYBOARD = InlineKeyboardMarkup(
     ]
 )
 
+# Общая клавиатура для всех 4 "изменить ...?" вопросов в /edit_event —
+# callback_data одна и та же на всех 4 шагах, потому что состояние
+# (EditEventStates.asking_*) и так однозначно определяет, к какому полю
+# относится ответ "да"/"нет".
+_EDIT_YES_NO_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Да", callback_data="edit_event:yes"),
+            InlineKeyboardButton(text="Нет", callback_data="edit_event:no"),
+        ]
+    ]
+)
+
+_EDIT_CONFIRM_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="edit_event:confirm"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data="edit_event:cancel"),
+        ]
+    ]
+)
+
+# Экран "нет событий для правки" (раздел 4 брифа, MSG_NO_EVENTS_TO_EDIT).
+_NO_EVENTS_EDIT_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Создать событие", callback_data="edit_event:create"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="edit_event:cancel_no_events"),
+        ]
+    ]
+)
+
 
 def _format_confirmation(data: dict) -> str:
     """
@@ -151,20 +222,23 @@ def _format_confirmation(data: dict) -> str:
     )
 
 
+def _register_chat_and_user(chat, user) -> None:
+    """
+    Регистрирует чат и пользователя в БД, если их там ещё нет — нужно
+    ПЕРЕД тем, как начинать /add_event, иначе сохранение события в конце
+    диалога упадёт: EVENTS.chat_id/created_by ссылаются на CHATS/USERS
+    (внешние ключи, см. database.py). Вынесено в функцию, потому что
+    запускать /add_event можно и напрямую командой, и кнопкой «➕ Создать
+    событие» с экрана "нет событий" в /edit_event.
+    """
+    upsert_chat(chat.id, chat.title)
+    upsert_user(user_id=user.id, username=user.username, first_name=user.first_name)
+
+
 @router.message(Command("add_event"))
 async def cmd_add_event(message: Message, state: FSMContext) -> None:
     """Шаг 0: запускает диалог, задаёт первый вопрос — название события."""
-    # На случай, если пользователь написал /add_event, ни разу не нажав
-    # /start в этом чате: регистрируем чат и пользователя здесь же, иначе
-    # сохранение события в конце диалога упадёт — EVENTS.chat_id/created_by
-    # ссылаются на CHATS/USERS (внешние ключи, см. database.py).
-    upsert_chat(message.chat.id, message.chat.title)
-    upsert_user(
-        user_id=message.from_user.id,
-        username=message.from_user.username,
-        first_name=message.from_user.first_name,
-    )
-
+    _register_chat_and_user(message.chat, message.from_user)
     await state.set_state(AddEventStates.waiting_title)
     await message.answer(MSG_ASK_EVENT_TITLE)
 
@@ -419,40 +493,39 @@ async def cmd_next_event(message: Message) -> None:
     await message.answer(MSG_NEXT_EVENT.format(body=body))
 
 
-# --- /delete_event (раздел 3.3 брифа) ---------------------------------
+# --- Общее для /delete_event и /edit_event: выбор события из списка ---
 #
-# В отличие от /add_event, здесь не нужен FSM (StatesGroup): пользователь
-# ничего не вводит текстом, только жмёт кнопки. Вся "память" на пути
-# список → подтверждение — это id события (и выбранный список — прошедшие
-# или предстоящие), зашитые прямо в callback_data кнопок
-# ("delete_event:scope:upcoming", "delete_event:select:<id>",
-# "delete_event:confirm:<id>"), этого достаточно, чтобы каждый следующий
-# шаг знал контекст.
+# Обе команды начинаются одинаково: показать предстоящие/прошедшие на
+# выбор (если оба списка непустые), затем список кнопками. Разница —
+# только в том, что происходит ПОСЛЕ выбора события, поэтому сам выбор
+# вынесен в общие функции, параметризованные префиксом callback_data
+# ("delete_event" / "edit_event") — так каждый следующий обработчик
+# точно знает, из какого диалога пришёл клик.
 
 
-def _build_delete_scope_keyboard() -> InlineKeyboardMarkup:
+def _build_scope_keyboard(command: str) -> InlineKeyboardMarkup:
     """
-    Кнопки выбора списка: предстоящие/прошедшие. Показывается только
-    когда оба списка непустые (см. cmd_delete_event) — иначе шаг просто
-    лишний клик без выбора.
+    Кнопки выбора списка: прошедшие/предстоящие. Показывается только
+    когда оба списка непустые (см. cmd_delete_event/cmd_edit_event) —
+    иначе шаг был бы лишним кликом без реального выбора.
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🗓 Прошедшие", callback_data="delete_event:scope:past"),
-                InlineKeyboardButton(text="📅 Предстоящие", callback_data="delete_event:scope:upcoming"),
+                InlineKeyboardButton(text="🗓 Прошедшие", callback_data=f"{command}:scope:past"),
+                InlineKeyboardButton(text="📅 Предстоящие", callback_data=f"{command}:scope:upcoming"),
             ]
         ]
     )
 
 
-def _build_delete_choice_keyboard(events: list) -> InlineKeyboardMarkup:
+def _build_event_choice_keyboard(command: str, events: list) -> InlineKeyboardMarkup:
     """Одна кнопка на событие: "дата — название"; id события — в callback_data."""
     rows = [
         [
             InlineKeyboardButton(
                 text=_format_event_title_line(event, _event_date(event)),
-                callback_data=f"delete_event:select:{event['id']}",
+                callback_data=f"{command}:select:{event['id']}",
             )
         ]
         for event in events
@@ -506,17 +579,17 @@ async def cmd_delete_event(message: Message) -> None:
 
     if upcoming and not past:
         await message.answer(
-            MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(upcoming)
+            MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_event_choice_keyboard("delete_event", upcoming)
         )
         return
 
     if past and not upcoming:
         await message.answer(
-            MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(past)
+            MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_event_choice_keyboard("delete_event", past)
         )
         return
 
-    await message.answer(MSG_ASK_DELETE_EVENT_SCOPE, reply_markup=_build_delete_scope_keyboard())
+    await message.answer(MSG_ASK_DELETE_EVENT_SCOPE, reply_markup=_build_scope_keyboard("delete_event"))
 
 
 @router.callback_query(F.data == "delete_event:scope:upcoming")
@@ -524,7 +597,7 @@ async def process_delete_scope_upcoming(callback: CallbackQuery) -> None:
     """Шаг 1а: выбрали «Предстоящие» — показываем список этого списка."""
     events = get_upcoming_events(callback.message.chat.id)
     await callback.message.edit_text(
-        MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(events)
+        MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_event_choice_keyboard("delete_event", events)
     )
     await callback.answer()
 
@@ -534,7 +607,7 @@ async def process_delete_scope_past(callback: CallbackQuery) -> None:
     """Шаг 1б: выбрали «Прошедшие» — показываем список этого списка."""
     events = get_past_events(callback.message.chat.id)
     await callback.message.edit_text(
-        MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(events)
+        MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_event_choice_keyboard("delete_event", events)
     )
     await callback.answer()
 
@@ -587,4 +660,331 @@ async def process_delete_confirm(callback: CallbackQuery) -> None:
 async def process_delete_cancel(callback: CallbackQuery) -> None:
     """Шаг 3б: отменили — событие остаётся как есть, без изменений."""
     await callback.message.edit_text(MSG_CANCELLED)
+    await callback.answer()
+
+
+# --- /edit_event (раздел 3.2 брифа) -------------------------------------
+#
+# Шаги 1–2 (список, с делением на предстоящие/прошедшие, и выбор события)
+# переиспользуют _build_scope_keyboard/_build_event_choice_keyboard из
+# блока /delete_event выше — тот же паттерн, другой префикс callback_data
+# ("edit_event" вместо "delete_event"). С момента выбора события
+# начинается FSM (EditEventStates): 4 вопроса "изменить это поле?"
+# подряд — название/дата/время/описание. Брифом (раздел 3.2) описаны
+# только первые 3 поля — он писался до того, как в событие добавили
+# description (раздел 3.1) — четвёртый вопрос добавлен для консистентности
+# с /add_event, где описание такое же необязательное поле, как и время.
+#
+# Накопленные изменения хранятся в FSMContext как data["changes"]
+# (словарь колонка→новое значение, ТОЛЬКО реально изменённые поля) вместе
+# с data["event_id"] — event_id нужен, чтобы в конце обновить именно
+# нужную строку, а неполный набор changes — и чтобы экран подтверждения
+# показывал только изменённое (раздел 3.2 брифа, шаг 7), и чтобы
+# update_event() в БД не трогала лишние колонки.
+
+
+@router.message(Command("edit_event"))
+async def cmd_edit_event(message: Message) -> None:
+    """
+    Шаг 1 — начало: та же логика, что в /delete_event (два раздельных
+    списка, шаг выбора списка — только если оба непустые). Если событий
+    нет вообще — шуточная фраза + кнопки «➕ Создать событие» / «❌ Отмена»
+    (раздел 4 брифа, MSG_NO_EVENTS_TO_EDIT).
+    """
+    upcoming = get_upcoming_events(message.chat.id)
+    past = get_past_events(message.chat.id)
+
+    if not upcoming and not past:
+        await message.answer(random_no_events(), reply_markup=_NO_EVENTS_EDIT_KEYBOARD)
+        return
+
+    if upcoming and not past:
+        await message.answer(
+            MSG_ASK_EDIT_EVENT_CHOICE, reply_markup=_build_event_choice_keyboard("edit_event", upcoming)
+        )
+        return
+
+    if past and not upcoming:
+        await message.answer(
+            MSG_ASK_EDIT_EVENT_CHOICE, reply_markup=_build_event_choice_keyboard("edit_event", past)
+        )
+        return
+
+    await message.answer(MSG_ASK_EDIT_EVENT_SCOPE, reply_markup=_build_scope_keyboard("edit_event"))
+
+
+@router.callback_query(F.data == "edit_event:scope:upcoming")
+async def process_edit_scope_upcoming(callback: CallbackQuery) -> None:
+    """Выбрали «Предстоящие» — показываем список этого списка."""
+    events = get_upcoming_events(callback.message.chat.id)
+    await callback.message.edit_text(
+        MSG_ASK_EDIT_EVENT_CHOICE, reply_markup=_build_event_choice_keyboard("edit_event", events)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "edit_event:scope:past")
+async def process_edit_scope_past(callback: CallbackQuery) -> None:
+    """Выбрали «Прошедшие» — показываем список этого списка."""
+    events = get_past_events(callback.message.chat.id)
+    await callback.message.edit_text(
+        MSG_ASK_EDIT_EVENT_CHOICE, reply_markup=_build_event_choice_keyboard("edit_event", events)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "edit_event:create")
+async def process_edit_create_event(callback: CallbackQuery, state: FSMContext) -> None:
+    """
+    «➕ Создать событие» с экрана "нет событий для правки" — по брифу
+    "ведёт в /add_event": запускает тот же диалог, что и команда напрямую
+    (переиспользует _register_chat_and_user из блока /add_event выше).
+    """
+    _register_chat_and_user(callback.message.chat, callback.from_user)
+    await state.set_state(AddEventStates.waiting_title)
+    await callback.message.edit_text(MSG_ASK_EVENT_TITLE)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "edit_event:cancel_no_events")
+async def process_edit_cancel_no_events(callback: CallbackQuery) -> None:
+    """«❌ Отмена» с экрана "нет событий для правки" — просто убираем кнопки."""
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("edit_event:select:"))
+async def process_edit_select(callback: CallbackQuery, state: FSMContext) -> None:
+    """
+    Шаг 2: выбрали событие — запускаем FSM и задаём первый из 4
+    вопросов "изменить это поле?" (название). changes пока пустой —
+    заполняется по мере ответов "да" + ввода текста.
+    """
+    event_id = int(callback.data.removeprefix("edit_event:select:"))
+    event = get_event_by_id(callback.message.chat.id, event_id)
+
+    if event is None:
+        await callback.message.edit_text(MSG_EVENT_ALREADY_GONE)
+        await callback.answer()
+        return
+
+    await state.update_data(event_id=event_id, changes={})
+    await state.set_state(EditEventStates.asking_title)
+    await callback.message.edit_text(MSG_ASK_EDIT_TITLE, reply_markup=_EDIT_YES_NO_KEYBOARD)
+    await callback.answer()
+
+
+# Шаг 3: «Изменить название?»
+
+
+@router.callback_query(EditEventStates.asking_title, F.data == "edit_event:yes")
+async def process_edit_title_yes(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(EditEventStates.waiting_title_text)
+    await callback.message.edit_text(MSG_EDIT_ENTER_TITLE)
+    await callback.answer()
+
+
+@router.callback_query(EditEventStates.asking_title, F.data == "edit_event:no")
+async def process_edit_title_no(callback: CallbackQuery, state: FSMContext) -> None:
+    """«Нет» — название не трогаем, сразу переходим к вопросу про дату."""
+    await state.set_state(EditEventStates.asking_date)
+    await callback.message.edit_text(MSG_ASK_EDIT_DATE, reply_markup=_EDIT_YES_NO_KEYBOARD)
+    await callback.answer()
+
+
+@router.message(EditEventStates.waiting_title_text, F.text)
+async def process_edit_title_text(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    changes = data["changes"]
+    changes["title"] = message.text.strip()
+    await state.update_data(changes=changes)
+
+    await state.set_state(EditEventStates.asking_date)
+    await message.answer(MSG_ASK_EDIT_DATE, reply_markup=_EDIT_YES_NO_KEYBOARD)
+
+
+# Шаг 4: «Изменить дату?»
+
+
+@router.callback_query(EditEventStates.asking_date, F.data == "edit_event:yes")
+async def process_edit_date_yes(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(EditEventStates.waiting_date_text)
+    await callback.message.edit_text(MSG_EDIT_ENTER_DATE)
+    await callback.answer()
+
+
+@router.callback_query(EditEventStates.asking_date, F.data == "edit_event:no")
+async def process_edit_date_no(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(EditEventStates.asking_time)
+    await callback.message.edit_text(MSG_ASK_EDIT_TIME, reply_markup=_EDIT_YES_NO_KEYBOARD)
+    await callback.answer()
+
+
+@router.message(EditEventStates.waiting_date_text, F.text)
+async def process_edit_date_text(message: Message, state: FSMContext) -> None:
+    """Валидируем дату; при ошибке — переспрашиваем этот же шаг (как в /add_event)."""
+    try:
+        parsed = datetime.strptime(message.text.strip(), _USER_DATE_FORMAT)
+    except ValueError:
+        await message.answer(MSG_INVALID_DATE)
+        return
+
+    data = await state.get_data()
+    changes = data["changes"]
+    changes["event_date"] = parsed.strftime(_DB_DATE_FORMAT)
+    await state.update_data(changes=changes)
+
+    await state.set_state(EditEventStates.asking_time)
+    await message.answer(MSG_ASK_EDIT_TIME, reply_markup=_EDIT_YES_NO_KEYBOARD)
+
+
+# Шаг 5: «Изменить время?»
+
+
+@router.callback_query(EditEventStates.asking_time, F.data == "edit_event:yes")
+async def process_edit_time_yes(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(EditEventStates.waiting_time_text)
+    await callback.message.edit_text(MSG_EDIT_ENTER_TIME)
+    await callback.answer()
+
+
+@router.callback_query(EditEventStates.asking_time, F.data == "edit_event:no")
+async def process_edit_time_no(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(EditEventStates.asking_description)
+    await callback.message.edit_text(MSG_ASK_EDIT_DESCRIPTION, reply_markup=_EDIT_YES_NO_KEYBOARD)
+    await callback.answer()
+
+
+@router.message(EditEventStates.waiting_time_text, F.text)
+async def process_edit_time_text(message: Message, state: FSMContext) -> None:
+    try:
+        parsed = datetime.strptime(message.text.strip(), _USER_TIME_FORMAT)
+    except ValueError:
+        await message.answer(MSG_INVALID_TIME)
+        return
+
+    data = await state.get_data()
+    changes = data["changes"]
+    changes["start_time"] = parsed.strftime(_USER_TIME_FORMAT)
+    await state.update_data(changes=changes)
+
+    await state.set_state(EditEventStates.asking_description)
+    await message.answer(MSG_ASK_EDIT_DESCRIPTION, reply_markup=_EDIT_YES_NO_KEYBOARD)
+
+
+# Шаг 6: «Изменить описание?» — последний вопрос, дальше подтверждение
+# (это поле сверх исходных 3 из брифа — см. комментарий в начале блока).
+
+
+@router.callback_query(EditEventStates.asking_description, F.data == "edit_event:yes")
+async def process_edit_description_yes(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(EditEventStates.waiting_description_text)
+    await callback.message.edit_text(MSG_EDIT_ENTER_DESCRIPTION)
+    await callback.answer()
+
+
+@router.callback_query(EditEventStates.asking_description, F.data == "edit_event:no")
+async def process_edit_description_no(callback: CallbackQuery, state: FSMContext) -> None:
+    """Последний вопрос, ответили «Нет» — переходим к итогу."""
+    text, keyboard = await _build_edit_summary(state, callback.message.chat.id)
+    if keyboard is None:
+        await state.clear()
+    else:
+        await state.set_state(EditEventStates.confirm)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.message(EditEventStates.waiting_description_text, F.text)
+async def process_edit_description_text(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    changes = data["changes"]
+    changes["description"] = message.text.strip()
+    await state.update_data(changes=changes)
+
+    text, keyboard = await _build_edit_summary(state, message.chat.id)
+    if keyboard is None:
+        await state.clear()
+    else:
+        await state.set_state(EditEventStates.confirm)
+    await message.answer(text, reply_markup=keyboard)
+
+
+async def _build_edit_summary(state: FSMContext, chat_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    """
+    Шаг 7: собирает финальный экран после всех 4 вопросов — либо
+    подтверждение только с изменёнными полями ("старое → новое", раздел
+    3.2 брифа), либо MSG_EDIT_NOTHING_CHANGED, если changes пуст ("выход
+    без подтверждения"). Клавиатура=None у второго варианта — сигнал
+    вызывающему коду, что состояние надо очистить, а не переводить
+    в EditEventStates.confirm.
+    """
+    data = await state.get_data()
+    changes = data.get("changes", {})
+
+    if not changes:
+        return MSG_EDIT_NOTHING_CHANGED, None
+
+    event = get_event_by_id(chat_id, data["event_id"])
+    if event is None:
+        # Событие успели удалить, пока пользователь отвечал на вопросы.
+        return MSG_EVENT_ALREADY_GONE, None
+
+    lines = []
+    if "title" in changes:
+        lines.append(f"Название: {event['title']} → {changes['title']}")
+    if "event_date" in changes:
+        old_display = _event_date(event).strftime(_USER_DATE_FORMAT)
+        new_display = datetime.strptime(changes["event_date"], _DB_DATE_FORMAT).strftime(_USER_DATE_FORMAT)
+        lines.append(f"Дата: {old_display} → {new_display}")
+    if "start_time" in changes:
+        old_display = event["start_time"] or MSG_EVENT_TIME_NOT_SET
+        lines.append(f"Время: {old_display} → {changes['start_time']}")
+    if "description" in changes:
+        old_display = event["description"] or MSG_EVENT_DESCRIPTION_NOT_SET
+        lines.append(f"Описание: {old_display} → {changes['description']}")
+
+    return MSG_EVENT_EDIT_CONFIRM.format(changes="\n".join(lines)), _EDIT_CONFIRM_KEYBOARD
+
+
+# Шаг 8: подтверждение
+
+
+@router.callback_query(EditEventStates.confirm, F.data == "edit_event:confirm")
+async def process_edit_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    """Шаг 8а: подтвердили — сохраняем только реально изменённые поля."""
+    data = await state.get_data()
+    event_id = data["event_id"]
+    changes = data["changes"]
+
+    updated = update_event(callback.message.chat.id, event_id, **changes)
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    if not updated:
+        # Событие успели удалить, пока экран подтверждения был открыт.
+        await callback.message.answer(MSG_EVENT_ALREADY_GONE)
+        await callback.answer()
+        return
+
+    # Название для MSG_EVENT_UPDATED: новое, если его меняли, иначе —
+    # текущее (событие точно ещё существует — update_event вернул True).
+    title = changes.get("title")
+    if title is None:
+        event = get_event_by_id(callback.message.chat.id, event_id)
+        title = event["title"]
+
+    await callback.message.answer(MSG_EVENT_UPDATED.format(title=title))
+    await callback.answer()
+
+    # TODO(следующий шаг): автообновление закрепа (раздел 3.10 брифа) —
+    # пока не реализовано.
+
+
+@router.callback_query(EditEventStates.confirm, F.data == "edit_event:cancel")
+async def process_edit_confirm_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    """Шаг 8б: отменили на экране подтверждения — не сохраняем ничего."""
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(MSG_CANCELLED)
     await callback.answer()

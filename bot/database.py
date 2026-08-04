@@ -358,3 +358,41 @@ def delete_event(chat_id: int, event_id: int) -> bool:
         return cursor.rowcount > 0
     finally:
         conn.close()
+
+
+def update_event(chat_id: int, event_id: int, **changes) -> bool:
+    """
+    Частично обновляет событие — только те колонки, что переданы в
+    changes (например update_event(chat_id, id, title="Новое название")).
+    Используется в /edit_event (раздел 3.2 брифа): обновляются только
+    реально изменённые поля, а не все сразу — это и экономит запись,
+    и позволяет показать экран подтверждения "старое → новое" только по
+    тем полям, которые действительно поменяли.
+
+    Про безопасность имён колонок: changes всегда собирается в коде
+    (bot/handlers/events.py — только из фиксированного набора {"title",
+    "event_date", "start_time", "description"}, тех же имён, что в
+    SCHEMA), никогда напрямую от пользователя. Поэтому подстановка имён
+    колонок через f-строку ниже безопасна: SQL-инъекция потребовала бы,
+    чтобы пользователь мог передать произвольное ИМЯ колонки, а не
+    только значение — а он не может, имена задаёт только код.
+
+    Возвращает True, если строка была найдена и обновлена, False — если
+    события с таким id в этом чате уже не было (кто-то успел его удалить,
+    пока пользователь отвечал на вопросы диалога) или changes оказался
+    пустым (нечего обновлять).
+    """
+    if not changes:
+        return False
+
+    conn = get_connection()
+    try:
+        set_clause = ", ".join(f"{column} = ?" for column in changes)
+        cursor = conn.execute(
+            f"UPDATE events SET {set_clause} WHERE id = ? AND chat_id = ?",
+            (*changes.values(), event_id, chat_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
