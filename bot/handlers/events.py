@@ -44,9 +44,18 @@ from aiogram.types import (
     Message,
 )
 
-from bot.database import get_upcoming_events, insert_event, upsert_chat, upsert_user
+from bot.database import (
+    delete_event,
+    get_all_events,
+    get_event_by_id,
+    get_upcoming_events,
+    insert_event,
+    upsert_chat,
+    upsert_user,
+)
 from bot.messages import (
     MSG_ALL_EVENTS,
+    MSG_ASK_DELETE_EVENT_CHOICE,
     MSG_ASK_EVENT_DATE,
     MSG_ASK_EVENT_DESCRIPTION,
     MSG_ASK_EVENT_DESCRIPTION_CHOICE,
@@ -54,7 +63,9 @@ from bot.messages import (
     MSG_ASK_EVENT_TIME_CHOICE,
     MSG_ASK_EVENT_TITLE,
     MSG_CANCELLED,
+    MSG_DELETE_EVENT_CONFIRM,
     MSG_EVENT_ADDED,
+    MSG_EVENT_ALREADY_GONE,
     MSG_EVENT_DESCRIPTION_NOT_SET,
     MSG_EVENT_SAVED,
     MSG_EVENT_TIME_NOT_SET,
@@ -405,3 +416,117 @@ async def cmd_next_event(message: Message) -> None:
     body += f"\n{format_days_until((event_date - date.today()).days)}"
 
     await message.answer(MSG_NEXT_EVENT.format(body=body))
+
+
+# --- /delete_event (раздел 3.3 брифа) ---------------------------------
+#
+# В отличие от /add_event, здесь не нужен FSM (StatesGroup): пользователь
+# ничего не вводит текстом, только жмёт кнопки. Вся "память" на пути
+# список → подтверждение — это id события, зашитый прямо в callback_data
+# кнопок ("delete_event:select:<id>", "delete_event:confirm:<id>"), его
+# достаточно, чтобы каждый следующий шаг знал, о каком событии речь.
+
+
+def _build_delete_choice_keyboard(events: list) -> InlineKeyboardMarkup:
+    """Одна кнопка на событие: "дата — название"; id события — в callback_data."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_format_event_title_line(event, _event_date(event)),
+                callback_data=f"delete_event:select:{event['id']}",
+            )
+        ]
+        for event in events
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _build_delete_confirm_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_event:confirm:{event_id}"),
+                InlineKeyboardButton(text="❌ Отменить", callback_data="delete_event:cancel"),
+            ]
+        ]
+    )
+
+
+def _format_delete_confirmation(event) -> str:
+    """Название+дата+время — обязательные детали перед необратимым удалением."""
+    time_display = event["start_time"] or MSG_EVENT_TIME_NOT_SET
+    return MSG_DELETE_EVENT_CONFIRM.format(
+        title=event["title"],
+        date=_event_date(event).strftime(_USER_DATE_FORMAT),
+        time=time_display,
+    )
+
+
+@router.message(Command("delete_event"))
+async def cmd_delete_event(message: Message) -> None:
+    """
+    Шаг 1: список событий кнопками. Список — ВСЕ события чата (get_all_events),
+    не только предстоящие: можно удалить и ошибочно добавленное прошедшее.
+    Нет событий → случайная фраза MSG_NO_EVENTS (брифом сказано использовать
+    её же, отдельного MSG_NO_EVENTS_TO_DELETE не заводили — см. messages.py).
+    """
+    events = get_all_events(message.chat.id)
+
+    if not events:
+        await message.answer(random_no_events())
+        return
+
+    await message.answer(
+        MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(events)
+    )
+
+
+@router.callback_query(F.data.startswith("delete_event:select:"))
+async def process_delete_select(callback: CallbackQuery) -> None:
+    """Шаг 2: выбрали событие — показываем детали и просим подтвердить удаление."""
+    event_id = int(callback.data.removeprefix("delete_event:select:"))
+    event = get_event_by_id(callback.message.chat.id, event_id)
+
+    if event is None:
+        # Кто-то успел удалить это событие, пока список с кнопками висел в чате.
+        await callback.message.edit_text(MSG_EVENT_ALREADY_GONE)
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        _format_delete_confirmation(event),
+        reply_markup=_build_delete_confirm_keyboard(event_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delete_event:confirm:"))
+async def process_delete_confirm(callback: CallbackQuery) -> None:
+    """
+    Шаг 3а: подтвердили — удаляем из БД. Отдельного сообщения об успехе
+    НЕТ (раздел 4 брифа, MSG_EVENT_DELETED) — по брифу обновлённого
+    закрепа достаточно; вместо него, раз закрепа ещё нет, просто помечаем
+    то же сообщение как выполненное.
+    """
+    event_id = int(callback.data.removeprefix("delete_event:confirm:"))
+    event = get_event_by_id(callback.message.chat.id, event_id)
+
+    if event is None:
+        await callback.message.edit_text(MSG_EVENT_ALREADY_GONE)
+        await callback.answer()
+        return
+
+    delete_event(callback.message.chat.id, event_id)
+
+    await callback.message.edit_text(f"🗑 Удалено: «{event['title']}»")
+    await callback.answer()
+
+    # TODO(следующий шаг): автообновление закрепа (раздел 3.10 брифа) —
+    # пока не реализовано.
+
+
+@router.callback_query(F.data == "delete_event:cancel")
+async def process_delete_cancel(callback: CallbackQuery) -> None:
+    """Шаг 3б: отменили — событие остаётся как есть, без изменений."""
+    await callback.message.edit_text(MSG_CANCELLED)
+    await callback.answer()
