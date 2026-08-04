@@ -19,6 +19,7 @@
 """
 
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 from bot.config import DB_PATH
@@ -243,5 +244,41 @@ def insert_event(
         )
         conn.commit()
         return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_upcoming_events(chat_id: int) -> list[sqlite3.Row]:
+    """
+    Возвращает ВСЕ предстоящие события чата (без ограничения на 30 дней
+    вперёд, в отличие от закрепа — см. раздел 3.10 брифа), отсортированные
+    от ближайшего к дальнему. Используется в /all_events (раздел 3.5) и
+    пригодится для /next_event (раздел 3.4) — там нужно то же самое, только
+    взять первую строку результата.
+
+    "Предстоящее" проверяется по event_date >= сегодня, без учёта времени:
+    событие сегодняшнего дня остаётся в списке весь день, даже если время
+    начала уже прошло — в БД нет времени окончания события, нет надёжного
+    способа понять, что оно уже завершилось (важный нюанс из раздела 3.4
+    брифа).
+    """
+    conn = get_connection()
+    try:
+        # event_date хранится в формате 'ГГГГ-ММ-ДД' (см. пояснение к SCHEMA
+        # выше) — date.today().isoformat() даёт строку в том же формате,
+        # поэтому сравнение "event_date >= today_iso" — обычное сравнение
+        # строк, а не дат, но благодаря одинаковому формату оно работает
+        # корректно.
+        today_iso = date.today().isoformat()
+        cursor = conn.execute(
+            """
+            SELECT id, title, event_date, start_time, description
+            FROM events
+            WHERE chat_id = ? AND event_date >= ?
+            ORDER BY event_date ASC, start_time ASC
+            """,
+            (chat_id, today_iso),
+        )
+        return cursor.fetchall()
     finally:
         conn.close()

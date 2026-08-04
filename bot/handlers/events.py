@@ -31,7 +31,7 @@
 именно поэтому в диалоге ничего не пишется в БД до экрана подтверждения.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
@@ -44,8 +44,9 @@ from aiogram.types import (
     Message,
 )
 
-from bot.database import insert_event, upsert_chat, upsert_user
+from bot.database import get_upcoming_events, insert_event, upsert_chat, upsert_user
 from bot.messages import (
+    MSG_ALL_EVENTS,
     MSG_ASK_EVENT_DATE,
     MSG_ASK_EVENT_DESCRIPTION,
     MSG_ASK_EVENT_DESCRIPTION_CHOICE,
@@ -59,6 +60,8 @@ from bot.messages import (
     MSG_EVENT_TIME_NOT_SET,
     MSG_INVALID_DATE,
     MSG_INVALID_TIME,
+    format_days_until,
+    random_no_events,
 )
 
 router = Router()
@@ -291,3 +294,56 @@ async def process_confirm_cancel(callback: CallbackQuery, state: FSMContext) -> 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(MSG_CANCELLED)
     await callback.answer()
+
+
+# «Ближе чем через 2 недели» из раздела 4 брифа (описание MSG_PIN) —
+# порог, при котором первое событие в списке получает пометку «‼️через N».
+_NEARBY_MARKER_THRESHOLD_DAYS = 14
+
+
+def _format_events_list(events: list) -> str:
+    """
+    Собирает многострочный текст списка событий для {events_list} в
+    MSG_ALL_EVENTS. Тот же формат впоследствии пригодится для закрепа
+    (MSG_PIN, раздел 3.10 брифа) — там выборка событий будет другая
+    (только ближайшие 30 дней + дни рождения), но построчный формат тот же.
+
+    Каждая строка: дата (+ время, если указано) — название. Самое первое
+    (то есть самое ближайшее) событие в списке дополнительно получает
+    пометку «—‼️через N», если оно ближе чем через 2 недели.
+    """
+    today = date.today()
+    lines = []
+    for index, event in enumerate(events):
+        event_date = datetime.strptime(event["event_date"], _DB_DATE_FORMAT).date()
+        line = event_date.strftime(_USER_DATE_FORMAT)
+        if event["start_time"]:
+            line += f" {event['start_time']}"
+        line += f" — {event['title']}"
+
+        if index == 0:
+            days_until = (event_date - today).days
+            if days_until < _NEARBY_MARKER_THRESHOLD_DAYS:
+                line += f" —‼️{format_days_until(days_until)}"
+
+        lines.append(line)
+    return "\n".join(lines)
+
+
+@router.message(Command("all_events"))
+async def cmd_all_events(message: Message) -> None:
+    """
+    /all_events — раздел 3.5 брифа. Чистое чтение, без диалога и без
+    состояния FSM: дополняет закреп (тот показывает только ближайшие
+    30 дней) полным списком всех предстоящих событий чата, от ближайшего
+    к дальнему.
+    """
+    events = get_upcoming_events(message.chat.id)
+
+    if not events:
+        # Та же случайная "нет событий" фраза, что и в /next_event,
+        # /edit_event, /delete_event — раздел 4 брифа, MSG_NO_EVENTS.
+        await message.answer(random_no_events())
+        return
+
+    await message.answer(MSG_ALL_EVENTS.format(events_list=_format_events_list(events)))
