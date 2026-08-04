@@ -47,6 +47,7 @@ BOT_COMMANDS = [
     BotCommand(command="add_event", description="Добавить событие"),
     BotCommand(command="all_events", description="Все предстоящие события"),
     BotCommand(command="next_event", description="Ближайшее событие"),
+    BotCommand(command="edit_event", description="Изменить событие"),
     BotCommand(command="delete_event", description="Удалить событие"),
 ]
 
