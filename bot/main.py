@@ -29,7 +29,7 @@ from aiogram.enums import ParseMode
 
 from bot.config import BOT_TOKEN
 from bot.database import init_db
-from bot.handlers import start
+from bot.handlers import events, start
 
 
 async def main() -> None:
@@ -50,10 +50,11 @@ async def main() -> None:
     )
     dp = Dispatcher()
 
-    # Подключаем роутер с обработчиком /start.
+    # Подключаем роутеры с обработчиками команд.
     # По мере роста бота здесь появятся другие include_router(...) —
-    # по одному на каждую группу команд из брифа (события, дни рождения…).
+    # по одному на каждую группу команд из брифа (дни рождения, ...).
     dp.include_router(start.router)
+    dp.include_router(events.router)
 
     # Перед запуском сбрасываем "зависшие" апдейты, которые Telegram мог
     # накопить, пока бот был выключен — иначе после запуска бот попытается

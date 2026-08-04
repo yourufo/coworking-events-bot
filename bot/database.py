@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS events (
     created_by  INTEGER NOT NULL REFERENCES users(user_id),
     title       TEXT NOT NULL,
     event_date  TEXT NOT NULL,   -- 'ГГГГ-ММ-ДД', см. пояснение выше
-    start_time  TEXT NOT NULL    -- 'ЧЧ:ММ'
+    start_time  TEXT,            -- 'ЧЧ:ММ', NULL — если время не указали
+    description TEXT             -- свободный текст, NULL — если пропустили
 );
 
 CREATE TABLE IF NOT EXISTS birthdays (
@@ -168,5 +169,45 @@ def upsert_user(user_id: int, username: str | None, first_name: str) -> None:
             (user_id, username, first_name),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_event(
+    chat_id: int,
+    created_by: int,
+    title: str,
+    event_date_iso: str,
+    start_time: str | None,
+    description: str | None,
+) -> int:
+    """
+    Сохраняет новое событие в таблицу EVENTS, возвращает его id.
+
+    event_date_iso передаётся уже в формате 'ГГГГ-ММ-ДД' (см. пояснение
+    к SCHEMA выше про хранение дат) — конвертацию из пользовательского
+    формата ДД.ММ.ГГГГ делает обработчик команды (bot/handlers/events.py),
+    здесь только сохранение "как есть".
+
+    start_time и description могут быть None — оба поля необязательны
+    (пользователь мог нажать «Пропустить» на соответствующем шаге диалога
+    /add_event).
+
+    chat_id и created_by должны уже существовать в CHATS/USERS
+    (внешние ключи) — на практике это гарантируется тем, что upsert_chat/
+    upsert_user вызываются раньше в handle_start и будут вызываться
+    в каждом обработчике, работающем в чате.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO events (chat_id, created_by, title, event_date, start_time, description)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (chat_id, created_by, title, event_date_iso, start_time, description),
+        )
+        conn.commit()
+        return cursor.lastrowid
     finally:
         conn.close()
