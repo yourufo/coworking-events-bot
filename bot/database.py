@@ -113,9 +113,42 @@ CREATE TABLE IF NOT EXISTS reminder_log (
 """
 
 
+
+# Колонки, добавленные в схему ПОСЛЕ того, как таблицы могли быть уже
+# созданы на чьей-то машине более ранней версией бота.
+#
+# Почему это вообще нужно: "CREATE TABLE IF NOT EXISTS" в SCHEMA выше
+# создаёт таблицу, только если её ещё нет вообще. Если таблица `events`
+# уже существует (бот уже запускался раньше), а мы потом добавили в SCHEMA
+# новую колонку — IF NOT EXISTS её не увидит и не добавит: физически в
+# файле БД колонки не будет, хотя в коде её уже ждут. Итог — ошибка вида
+# "table events has no column named description" при попытке что-то
+# сохранить, и никакие данные, введённые до этой ошибки, не сохраняются.
+#
+# Решение — простая ручная миграция: при каждом старте бота проверяем по
+# списку "таблица.колонка должна существовать" и через ALTER TABLE
+# добавляем недостающие. Уже существующие колонки и данные в них не
+# трогаем — только дописываем то, чего не хватает.
+_COLUMN_MIGRATIONS = [
+    # (таблица, колонка, SQL-тип колонки для ALTER TABLE)
+    ("events", "description", "TEXT"),
+]
+
+
+def _run_column_migrations(conn: sqlite3.Connection) -> None:
+    """Добавляет недостающие колонки из _COLUMN_MIGRATIONS, если их ещё нет."""
+    for table, column, column_type in _COLUMN_MIGRATIONS:
+        existing_columns = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+
 def init_db() -> None:
     """
-    Создаёт все таблицы, если их ещё нет.
+    Создаёт все таблицы, если их ещё нет, и до-накатывает недостающие
+    колонки на уже существующие таблицы (см. _COLUMN_MIGRATIONS выше).
 
     Вызывается один раз при каждом старте бота (см. bot/main.py) — это
     называется "миграция при запуске" в самом простом варианте: на старте
@@ -124,6 +157,7 @@ def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
+        _run_column_migrations(conn)
         conn.commit()
     finally:
         conn.close()
