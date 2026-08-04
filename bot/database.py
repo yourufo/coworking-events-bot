@@ -284,25 +284,30 @@ def get_upcoming_events(chat_id: int) -> list[sqlite3.Row]:
         conn.close()
 
 
-def get_all_events(chat_id: int) -> list[sqlite3.Row]:
+def get_past_events(chat_id: int) -> list[sqlite3.Row]:
     """
-    Возвращает ВСЕ события чата — в отличие от get_upcoming_events, БЕЗ
-    фильтра "только предстоящие". Используется для списка кнопками в
-    /edit_event и /delete_event (разделы 3.2/3.3 брифа): в отличие от
-    /next_event и /all_events, где смысл команды — "что нас ждёт впереди",
-    здесь пользователь может захотеть найти и удалить/поправить и уже
-    прошедшее событие (например, добавленное по ошибке с неверной датой).
+    Возвращает ПРОШЕДШИЕ события чата (event_date < сегодня), от самого
+    недавнего к самому старому — зеркально get_upcoming_events, только
+    в другую сторону по времени и с обратной сортировкой: самое вероятно
+    нужное (недавно прошедшее) оказывается сверху списка.
+
+    Используется в /delete_event (раздел 3.3 брифа) как один из двух
+    списков на выбор — вместе с get_upcoming_events. Единый список из
+    ВСЕХ событий чата (без разделения на прошедшие/предстоящие) быстро
+    становится нечитаемой портянкой, особенно в чате, который живёт
+    больше года; тот же паттерн пригодится и в будущем /edit_event.
     """
     conn = get_connection()
     try:
+        today_iso = date.today().isoformat()
         cursor = conn.execute(
             """
             SELECT id, title, event_date, start_time, description
             FROM events
-            WHERE chat_id = ?
-            ORDER BY event_date ASC, start_time ASC
+            WHERE chat_id = ? AND event_date < ?
+            ORDER BY event_date DESC, start_time DESC
             """,
-            (chat_id,),
+            (chat_id, today_iso),
         )
         return cursor.fetchall()
     finally:

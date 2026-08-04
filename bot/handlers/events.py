@@ -46,8 +46,8 @@ from aiogram.types import (
 
 from bot.database import (
     delete_event,
-    get_all_events,
     get_event_by_id,
+    get_past_events,
     get_upcoming_events,
     insert_event,
     upsert_chat,
@@ -56,6 +56,7 @@ from bot.database import (
 from bot.messages import (
     MSG_ALL_EVENTS,
     MSG_ASK_DELETE_EVENT_CHOICE,
+    MSG_ASK_DELETE_EVENT_SCOPE,
     MSG_ASK_EVENT_DATE,
     MSG_ASK_EVENT_DESCRIPTION,
     MSG_ASK_EVENT_DESCRIPTION_CHOICE,
@@ -422,9 +423,27 @@ async def cmd_next_event(message: Message) -> None:
 #
 # В отличие от /add_event, здесь не нужен FSM (StatesGroup): пользователь
 # ничего не вводит текстом, только жмёт кнопки. Вся "память" на пути
-# список → подтверждение — это id события, зашитый прямо в callback_data
-# кнопок ("delete_event:select:<id>", "delete_event:confirm:<id>"), его
-# достаточно, чтобы каждый следующий шаг знал, о каком событии речь.
+# список → подтверждение — это id события (и выбранный список — прошедшие
+# или предстоящие), зашитые прямо в callback_data кнопок
+# ("delete_event:scope:upcoming", "delete_event:select:<id>",
+# "delete_event:confirm:<id>"), этого достаточно, чтобы каждый следующий
+# шаг знал контекст.
+
+
+def _build_delete_scope_keyboard() -> InlineKeyboardMarkup:
+    """
+    Кнопки выбора списка: предстоящие/прошедшие. Показывается только
+    когда оба списка непустые (см. cmd_delete_event) — иначе шаг просто
+    лишний клик без выбора.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📅 Предстоящие", callback_data="delete_event:scope:upcoming"),
+                InlineKeyboardButton(text="🗓 Прошедшие", callback_data="delete_event:scope:past"),
+            ]
+        ]
+    )
 
 
 def _build_delete_choice_keyboard(events: list) -> InlineKeyboardMarkup:
@@ -465,20 +484,59 @@ def _format_delete_confirmation(event) -> str:
 @router.message(Command("delete_event"))
 async def cmd_delete_event(message: Message) -> None:
     """
-    Шаг 1: список событий кнопками. Список — ВСЕ события чата (get_all_events),
-    не только предстоящие: можно удалить и ошибочно добавленное прошедшее.
-    Нет событий → случайная фраза MSG_NO_EVENTS (брифом сказано использовать
-    её же, отдельного MSG_NO_EVENTS_TO_DELETE не заводили — см. messages.py).
-    """
-    events = get_all_events(message.chat.id)
+    Шаг 0: решаем, что показать дальше.
 
-    if not events:
+    Списки предстоящих и прошедших событий запрашиваются отдельно (не
+    один общий список из всех событий чата) — чат, который живёт больше
+    года, иначе выдал бы нечитаемую портянку из давно неактуальной
+    лабуды. Логика:
+    - оба списка пустые → случайная фраза MSG_NO_EVENTS (брифом сказано
+      использовать именно её, отдельного MSG_NO_EVENTS_TO_DELETE не
+      заводили — см. messages.py);
+    - только один из списков непустой → сразу показываем его, шаг выбора
+      списка был бы лишним кликом без реального выбора;
+    - оба непустые → спрашиваем, какой список открыть (шаг 1).
+    """
+    upcoming = get_upcoming_events(message.chat.id)
+    past = get_past_events(message.chat.id)
+
+    if not upcoming and not past:
         await message.answer(random_no_events())
         return
 
-    await message.answer(
+    if upcoming and not past:
+        await message.answer(
+            MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(upcoming)
+        )
+        return
+
+    if past and not upcoming:
+        await message.answer(
+            MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(past)
+        )
+        return
+
+    await message.answer(MSG_ASK_DELETE_EVENT_SCOPE, reply_markup=_build_delete_scope_keyboard())
+
+
+@router.callback_query(F.data == "delete_event:scope:upcoming")
+async def process_delete_scope_upcoming(callback: CallbackQuery) -> None:
+    """Шаг 1а: выбрали «Предстоящие» — показываем список этого списка."""
+    events = get_upcoming_events(callback.message.chat.id)
+    await callback.message.edit_text(
         MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(events)
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "delete_event:scope:past")
+async def process_delete_scope_past(callback: CallbackQuery) -> None:
+    """Шаг 1б: выбрали «Прошедшие» — показываем список этого списка."""
+    events = get_past_events(callback.message.chat.id)
+    await callback.message.edit_text(
+        MSG_ASK_DELETE_EVENT_CHOICE, reply_markup=_build_delete_choice_keyboard(events)
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("delete_event:select:"))
