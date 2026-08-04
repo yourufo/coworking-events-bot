@@ -439,8 +439,8 @@ def _build_delete_scope_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📅 Предстоящие", callback_data="delete_event:scope:upcoming"),
                 InlineKeyboardButton(text="🗓 Прошедшие", callback_data="delete_event:scope:past"),
+                InlineKeyboardButton(text="📅 Предстоящие", callback_data="delete_event:scope:upcoming"),
             ]
         ]
     )
