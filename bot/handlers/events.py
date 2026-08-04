@@ -303,17 +303,22 @@ _NEARBY_MARKER_THRESHOLD_DAYS = 14
 
 def _format_events_list(events: list) -> str:
     """
-    Собирает многострочный текст списка событий для {events_list} в
-    MSG_ALL_EVENTS. Тот же формат впоследствии пригодится для закрепа
-    (MSG_PIN, раздел 3.10 брифа) — там выборка событий будет другая
-    (только ближайшие 30 дней + дни рождения), но построчный формат тот же.
+    Собирает текст списка событий для {events_list} в MSG_ALL_EVENTS.
+    Тот же формат впоследствии пригодится для закрепа (MSG_PIN, раздел
+    3.10 брифа) — там выборка событий будет другая (только ближайшие
+    30 дней + дни рождения), но формат каждой записи тот же.
 
-    Каждая строка: дата (+ время, если указано) — название. Самое первое
-    (то есть самое ближайшее) событие в списке дополнительно получает
-    пометку «—‼️через N», если оно ближе чем через 2 недели.
+    Каждая запись — это дата (+ время, если указано) — название, и, если
+    есть, вторая строка с описанием (описание необязательное — см.
+    /add_event, раздел 3.1). Самое первое (то есть самое ближайшее)
+    событие в списке дополнительно получает пометку «—‼️через N», если оно
+    ближе чем через 2 недели.
+
+    Записи разделяются пустой строкой — иначе двухстрочные записи (с
+    описанием) сливались бы визуально с соседними.
     """
     today = date.today()
-    lines = []
+    entries = []
     for index, event in enumerate(events):
         event_date = datetime.strptime(event["event_date"], _DB_DATE_FORMAT).date()
         line = event_date.strftime(_USER_DATE_FORMAT)
@@ -326,8 +331,11 @@ def _format_events_list(events: list) -> str:
             if days_until < _NEARBY_MARKER_THRESHOLD_DAYS:
                 line += f" —‼️{format_days_until(days_until)}"
 
-        lines.append(line)
-    return "\n".join(lines)
+        if event["description"]:
+            line += f"\n{event['description']}"
+
+        entries.append(line)
+    return "\n\n".join(entries)
 
 
 @router.message(Command("all_events"))
